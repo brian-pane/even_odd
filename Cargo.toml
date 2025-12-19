@@ -1,0 +1,21 @@
+[package]
+name = "even_odd"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+debug = true
+
+[profile.test]
+opt-level = 2
+
+[profile.bench]
+opt-level = 2
+
+[dependencies]
+criterion = "0.8.1"
+rayon = "1.11.0"
+
+[[bench]]
+name = "even_odd_benchmark"
+harness = false
