@@ -2,11 +2,9 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 
 pub fn is_even(num: u32) -> bool {
-    let mut count = 0usize;
     let mut even = false;
     let mut known_even = Some(0u32);
     while let Some(known) = known_even {
-        count = count.saturating_add(1);
         if num == known {
             even = true;
         }
@@ -42,13 +40,11 @@ pub fn is_even_parallel(num: u32) -> bool {
     chunks.par_iter().for_each(move |&(start_block, num_blocks)| {
         let mut local_even = false;
         let mut known_even = (start_block * BLOCK_SIZE) as u32;
-        for _ in 0..num_blocks {
-            for _ in 0..BLOCK_SIZE / 2 {
-                if known_even == num {
-                    local_even = true;
-                }
-                known_even = known_even.wrapping_add(2);
+        for _ in 0..BLOCK_SIZE * num_blocks / 2 {
+            if known_even == num {
+                local_even = true;
             }
+            known_even = known_even.wrapping_add(2);
         }
         if local_even {
             *worker_even.lock().unwrap() = true;
