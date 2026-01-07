@@ -1,8 +1,7 @@
 use rayon::prelude::*;
-use std::sync::mpsc;
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::thread::JoinHandle;
+use wgpu::util::DeviceExt;
 
 pub fn is_even(num: u32) -> bool {
     let mut even = false;
@@ -68,78 +67,154 @@ pub fn is_even_rayon(num: u32) -> bool {
     *even.lock().unwrap()
 }
 
-pub struct EvenOdd {
-    workers: Vec<JoinHandle<()>>,
-    to_workers: Vec<mpsc::Sender<Option<Request>>>,
+pub struct WgpuEvenOdd {
+    queue: wgpu::Queue,
+    pub shader: wgpu::ShaderModule,
+    pub device: wgpu::Device,
 }
 
-struct Request {
-    num: u32,
-    tx: mpsc::Sender<bool>,
-}
-
-impl EvenOdd {
+impl WgpuEvenOdd {
     pub fn new() -> Self {
-        let chunks = partition_chunks(std::thread::available_parallelism().unwrap().get());
-        let mut workers = Vec::with_capacity(chunks.len());
-        let mut to_workers = Vec::with_capacity(chunks.len());
-        for (start_block, num_blocks) in chunks {
-            let (tx, rx) = mpsc::channel::<Option<Request>>();
-            to_workers.push(tx);
-            workers.push(thread::spawn(move || {
-                loop {
-                    let received = rx.recv().unwrap();
-                    match received {
-                        None => break,
-                        Some(request) => {
-                            let mut local_even = false;
-                            let mut known_even = (start_block * BLOCK_SIZE) as u32;
-                            for _ in 0..BLOCK_SIZE * num_blocks / 2 {
-                                if known_even == request.num {
-                                    local_even = true;
-                                }
-                                known_even = known_even.wrapping_add(2);
-                            }
-                            request.tx.send(local_even).unwrap();
-                        }
-                    }
-                }
-            }));
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = futures::executor::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )
+        .unwrap();
+        if !adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        {
+            panic!("WGPU adapter does not support compute shaders");
         }
+        let device_descriptor = wgpu::DeviceDescriptor {
+            label: None,
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        };
+        let (device, queue) =
+            futures::executor::block_on(adapter.request_device(&device_descriptor)).unwrap();
+        let shader = device.create_shader_module(wgpu::include_wgsl!("even_odd.wgsl"));
         Self {
-            workers,
-            to_workers,
+            device,
+            queue,
+            shader,
         }
     }
 
     pub fn is_even(&self, num: u32) -> bool {
-        let mut from_workers = Vec::with_capacity(self.to_workers.len());
-        for to_worker in &self.to_workers {
-            let (tx, rx) = mpsc::channel::<bool>();
-            from_workers.push(rx);
-            to_worker.send(Some(Request { num, tx })).unwrap();
+        let input_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[num]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let output_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[0u32]),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+        let output_for_cpu = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: input_buffer.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                min_binding_size: Some(NonZeroU64::new(4).unwrap()),
+                                has_dynamic_offset: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                min_binding_size: Some(NonZeroU64::new(4).unwrap()),
+                                has_dynamic_offset: false,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&bind_group_layout],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                module: &self.shader,
+                entry_point: Some("is_even"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            const WORKGROUP_SIZE: u64 = 131072; // must match even_odd.wgsl
+            const NUM_WORKGROUPS: u32 = ((u32::MAX as u64 + 1) / WORKGROUP_SIZE) as _;
+            compute_pass.dispatch_workgroups(NUM_WORKGROUPS, 1, 1);
         }
-        let mut even = false;
-        for rx in from_workers {
-            let received = rx.recv().unwrap();
-            even |= received;
-        }
-        even
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &output_for_cpu, 0, output_buffer.size());
+        let command_buffer = encoder.finish();
+        self.queue.submit([command_buffer]);
+        let output_slice = output_for_cpu.slice(..);
+        output_slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let data = output_slice.get_mapped_range();
+        let result: &[u32] = bytemuck::cast_slice(&data);
+        result[0] != 0
     }
 }
 
-impl Default for EvenOdd {
+impl Default for WgpuEvenOdd {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for EvenOdd {
-    fn drop(&mut self) {
-        self.to_workers.iter().for_each(|tx| {
-            tx.send(None).unwrap();
-        });
-        self.workers.drain(..).for_each(|w| w.join().unwrap());
     }
 }
 
@@ -150,41 +225,39 @@ mod tests {
 
     #[test]
     fn single_threaded() {
-        for (num, expected) in [
-            (0, true),
-            (1, false),
-            (2, true),
-            (9_999_999, false),
-            (u32::MAX, false),
-        ] {
-            assert_eq!(is_even(black_box(num)), expected);
-        }
+        assert_eq!(is_even(black_box(0)), true);
+        assert_eq!(is_even(black_box(1)), false);
+        assert_eq!(is_even(black_box(2)), true);
+        assert_eq!(is_even(black_box(9_999_999)), false);
+        assert_eq!(is_even(black_box(100_000_000)), true);
+        assert_eq!(is_even(black_box(3_000_000_004)), true);
+        assert_eq!(is_even(u32::MAX - 1), true);
+        assert_eq!(is_even(u32::MAX), false);
     }
 
     #[test]
     fn rayon() {
-        for (num, expected) in [
-            (0, true),
-            (1, false),
-            (2, true),
-            (9_999_999, false),
-            (u32::MAX, false),
-        ] {
-            assert_eq!(is_even_rayon(black_box(num)), expected);
-        }
+        assert_eq!(is_even_rayon(black_box(0)), true);
+        assert_eq!(is_even_rayon(black_box(1)), false);
+        assert_eq!(is_even_rayon(black_box(2)), true);
+        assert_eq!(is_even_rayon(black_box(9_999_999)), false);
+        assert_eq!(is_even_rayon(black_box(100_000_000)), true);
+        assert_eq!(is_even_rayon(black_box(3_000_000_004)), true);
+        assert_eq!(is_even_rayon(u32::MAX - 1), true);
+        assert_eq!(is_even_rayon(u32::MAX), false);
     }
 
     #[test]
-    fn even_odd() {
-        let even_odd = EvenOdd::new();
-        for (num, expected) in [
-            (0, true),
-            (1, false),
-            (2, true),
-            (9_999_999, false),
-            (u32::MAX, false),
-        ] {
-            assert_eq!(even_odd.is_even(black_box(num)), expected);
-        }
+    fn wgpu() {
+        let even_odd = WgpuEvenOdd::new();
+        assert_eq!(even_odd.is_even(black_box(0)), true);
+        assert_eq!(even_odd.is_even(black_box(1)), false);
+        assert_eq!(even_odd.is_even(black_box(2)), true);
+        assert_eq!(even_odd.is_even(black_box(9_999_999)), false);
+        assert_eq!(even_odd.is_even(black_box(100_000_000)), true);
+        assert_eq!(even_odd.is_even(black_box(3_000_000_004)), true);
+        assert_eq!(even_odd.is_even(black_box(4_294_767_290)), true);
+        assert_eq!(even_odd.is_even(u32::MAX - 1), true);
+        assert_eq!(even_odd.is_even(u32::MAX), false);
     }
 }
