@@ -25,6 +25,6 @@ fn max_wgpu(c: &mut Criterion) {
     });
 }
 
-criterion_group!(threadpool, max_wgpu);
+criterion_group!(wgpu, max_wgpu);
 
-criterion_main!(single_threaded, rayon, threadpool);
+criterion_main!(/*single_threaded, rayon,*/ wgpu);
