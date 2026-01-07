@@ -196,7 +196,7 @@ impl WgpuEvenOdd {
             compute_pass.set_bind_group(0, &bind_group, &[]);
             const WORKGROUP_SIZE: u64 = 131072; // must match even_odd.wgsl
             const NUM_WORKGROUPS: u32 = ((u32::MAX as u64 + 1) / WORKGROUP_SIZE) as _;
-            compute_pass.dispatch_workgroups(NUM_WORKGROUPS, 1, 1);
+            compute_pass.dispatch_workgroups(NUM_WORKGROUPS / 64, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&output_buffer, 0, &output_for_cpu, 0, output_buffer.size());
         let command_buffer = encoder.finish();
